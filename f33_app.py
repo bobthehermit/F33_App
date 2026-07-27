@@ -43,6 +43,9 @@ CORE_COLS = ["PartII-Total", "Part III", "Part IV"]
 #     11113 cash, etc.), not revenue -> excluded
 #   * object 41924 = district-to-charter flow-through -> excluded
 #     (double count; the charter reports it as its own revenue)
+
+
+
 def is_excluded_rev_object(obj: str) -> bool:
     o = str(obj).strip()
     return (not o.startswith("4")) or o == "41924"
@@ -90,6 +93,25 @@ def load_pbi_export(file) -> pd.DataFrame:
     dropped = df.loc[keyless, "amount"].sum()
     return df[~keyless].reset_index(drop=True), int(keyless.sum()), dropped
 
+def load_entity_alias(path: str) -> dict:
+    """Entity name -> PED_NO lookup, built from OBMS entity codes."""
+    alias = pd.read_csv(path, dtype=str)
+    alias.columns = [c.strip() for c in alias.columns]
+    return dict(zip(alias["Entity"].str.strip(), alias["PED_NO"].str.strip()))
+
+
+def attach_ped_no(df: pd.DataFrame, alias_map: dict) -> tuple[pd.DataFrame, pd.DataFrame, float]:
+    """Adds PED_NO as the first column. Nothing is dropped — unmatched
+    entities are flagged and dollared, same philosophy as new_combos."""
+    df = df.copy()
+    df["PED_NO"] = df["Entity"].map(alias_map)
+    unmatched_mask = df["PED_NO"].isna()
+    unmatched_entities = (df.loc[unmatched_mask]
+                          .groupby("Entity", as_index=False)["amount"].sum()
+                          .sort_values("amount", ascending=False))
+    unmatched_dollars = df.loc[unmatched_mask, "amount"].sum()
+    cols = ["PED_NO"] + [c for c in df.columns if c != "PED_NO"]
+    return df[cols], unmatched_entities, unmatched_dollars
 
 def load_xwalk(path: str, keys: list[str]) -> tuple[pd.DataFrame, list[str]]:
     xw = pd.read_csv(path, dtype=str)
@@ -212,6 +234,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 xw_exp_path = next(iter(glob.glob(os.path.join(BASE, "xwalk_exp*.csv"))), None)
 xw_rev_path = next(iter(glob.glob(os.path.join(BASE, "xwalk_rev*.csv"))), None)
 ov_exp_path = next(iter(glob.glob(os.path.join(BASE, "overrides_exp*.csv"))), None)
+entity_alias_path = next(iter(glob.glob(os.path.join(BASE, "entity_alias.csv"))), None)
 
 c1, c2 = st.columns(2)
 with c1:
@@ -225,6 +248,9 @@ if st.button("Generate F-33 Output", type="primary"):
         st.write("Looking in:", BASE)
         st.write(os.listdir(BASE))
         st.stop()
+    if not entity_alias_path:
+        st.error("entity_alias.csv not found next to this script.")
+        st.stop()
     if not (rev_file and exp_file):
         st.warning("Upload both files.")
         st.stop()
@@ -232,9 +258,11 @@ if st.button("Generate F-33 Output", type="primary"):
     with st.spinner("Running validated pipelines..."):
         xw_exp, exp_parts = load_xwalk(xw_exp_path, EXP_KEYS)
         xw_rev, rev_parts = load_xwalk(xw_rev_path, REV_KEYS)
+        alias_map = load_entity_alias(entity_alias_path)
         df_exp, exp_keyless, exp_keyless_amt = load_pbi_export(exp_file)
         df_rev, rev_keyless, rev_keyless_amt = load_pbi_export(rev_file)
-
+        df_exp, exp_unmatched_entities, exp_ent_unmatched_dollars = attach_ped_no(df_exp, alias_map)
+        df_rev, rev_unmatched_entities, rev_ent_unmatched_dollars = attach_ped_no(df_rev, alias_map)
         exp_long, exp_new, exp_stats, exp_blank = run_pipeline(
             df_exp, xw_exp, EXP_KEYS, exp_parts, ov_exp_path)
         rev_long, rev_new, rev_stats, rev_blank = run_pipeline(
@@ -243,7 +271,9 @@ if st.button("Generate F-33 Output", type="primary"):
 
     ready = (exp_stats["unmatched_dollars"] == 0
              and exp_stats["blank_mapped_dollars"] == 0
-             and rev_stats["unmatched_dollars"] == 0)
+             and rev_stats["unmatched_dollars"] == 0
+             and exp_ent_unmatched_dollars == 0
+             and rev_ent_unmatched_dollars == 0)
     if ready:
         st.success("All dollars mapped. Output is submission-grade.")
     else:
@@ -253,10 +283,12 @@ if st.button("Generate F-33 Output", type="primary"):
             f"blank-mapped dollars: ${exp_stats['blank_mapped_dollars']:,.2f}, "
             f"revenues ${rev_stats['unmatched_dollars']:,.2f} "
             f"({rev_stats['unmatched_rows']:,} rows). Assign F-33 codes to the new "
-            f"combos, fix the blank-mapped rows, and rerun.")
+            f"combos, fix the blank-mapped rows, and rerun. "
+            f"unmatched entities: expenditures ${exp_ent_unmatched_dollars:,.2f}, "
+            f"revenues ${rev_ent_unmatched_dollars:,.2f}. ")
 
-    t1, t2, t3, t4 = st.tabs(["Reconciliation", "Statewide", "Per-entity",
-                              "New combos"])
+    t1, t2, t3, t4, t5 = st.tabs(["Reconciliation", "Statewide", "Per-entity",
+                                  "New combos", "Unmatched entities"])
     with t1:
         rec = pd.DataFrame([
             ["Expenditures", exp_stats["rows"], f"${exp_stats['total']:,.2f}",
@@ -308,3 +340,9 @@ if st.button("Generate F-33 Output", type="primary"):
         st.dataframe(exp_blank, use_container_width=True, height=260)
         dl_button("Download blank-mapped exp rows", exp_blank,
                 "blank_mapped_exp.csv")
+    with t5:
+        st.write("**Expenditure entities not found in entity_alias.csv** "
+                 "(add them with their PED_NO before this is submission-ready):")
+        st.dataframe(exp_unmatched_entities, use_container_width=True, height=200)
+        st.write("**Revenue entities not found in entity_alias.csv:**")
+        st.dataframe(rev_unmatched_entities, use_container_width=True, height=200)
