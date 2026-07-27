@@ -3,7 +3,7 @@
 *.xlsx
 *.xls
 #except lea list and xwalks
-!lea_master.csv
+!canonical_lea_master.csv
 !xwalk_exp_canonical_FY25.csv
 !xwalk_rev_canonical_FY25.csv
 
