@@ -2,11 +2,10 @@
 *.csv
 *.xlsx
 *.xls
-# ...except the crosswalks — these are reference logic, not data
-!xwalk_rev.csv
-!xwalk_exp_main.csv
-!xwalk_exp_fund.csv
-!xwalk_exp_teacher.csv
+#except lea list and xwalks
+!lea_master.csv
+!xwalk_exp_canonical_FY25.csv
+!xwalk_rev_canonical_FY25.csv
 
 # Python
 __pycache__/
