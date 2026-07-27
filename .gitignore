@@ -6,6 +6,7 @@
 !canonical_lea_master.csv
 !xwalk_exp_canonical_FY25.csv
 !xwalk_rev_canonical_FY25.csv
+!entity_alias.csv
 
 # Python
 __pycache__/

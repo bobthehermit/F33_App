@@ -43,6 +43,15 @@ CORE_COLS = ["PartII-Total", "Part III", "Part IV"]
 #     11113 cash, etc.), not revenue -> excluded
 #   * object 41924 = district-to-charter flow-through -> excluded
 #     (double count; the charter reports it as its own revenue)
+EXP_EXCL_ANY   = {"58214", "55912"}   # debt service reserve booked in error;
+                                      # interagency/charter flowthrough
+EXP_EXCL_F5000 = {"53414", "54320"}   # issuance/professional fees, tech repairs
+                                      # — debt context only
+
+def exp_exclusions(df: pd.DataFrame) -> pd.Series:
+    o = df["Object"].astype(str).str.strip()
+    f = df["Function"].astype(str).str.strip()
+    return o.isin(EXP_EXCL_ANY) | (f.eq("5000") & o.isin(EXP_EXCL_F5000))
 
 
 
@@ -153,9 +162,11 @@ def run_pipeline(df: pd.DataFrame, xw: pd.DataFrame, keys: list[str],
                  part_cols: list[str], ov_path: str | None,
                  exclusion_rule=None):
     merged = df.merge(xw, on=keys, how="left", indicator=True)
+
+    is_excl = pd.Series(False, index=merged.index)
     excl_dollars = 0.0
-    if exclusion_rule and "Object" in merged.columns:
-        is_excl = merged["Object"].map(exclusion_rule)
+    if exclusion_rule is not None:
+        is_excl = exclusion_rule(merged).fillna(False).astype(bool)
         excl_dollars = merged.loc[is_excl, "amount"].sum()
         for c in part_cols:
             if c in merged.columns:
@@ -165,9 +176,9 @@ def run_pipeline(df: pd.DataFrame, xw: pd.DataFrame, keys: list[str],
     if ov_path and os.path.exists(ov_path):
         n_ov = apply_overrides(merged, ov_path, keys, part_cols)
     un = merged["_merge"] == "left_only"
-    core_present = [c for c in CORE_COLS if c in merged.columns]
+    core_present = [c for c in part_cols if c in merged.columns]
     if core_present:
-        blank_core = merged["_merge"] == "both"
+        blank_core = (merged["_merge"] == "both") & ~is_excl
         for c in core_present:
             blank_core &= (merged[c].fillna("") == "")
         blank_mapped = (merged.loc[blank_core]
@@ -187,9 +198,9 @@ def run_pipeline(df: pd.DataFrame, xw: pd.DataFrame, keys: list[str],
         sub = merged[merged[pc].fillna("") != ""]
         if sub.empty:
             continue
-        g = (sub.groupby(["Entity", pc], as_index=False)["amount"].sum()
+        g = (sub.groupby(["Entity", "PED_NO", pc], as_index=False)["amount"].sum()
                 .rename(columns={pc: "item_code"}))
-        g.insert(1, "part_column", pc)
+        g.insert(2, "part_column", pc)
         frames.append(g)
     long_out = (pd.concat(frames, ignore_index=True)
                 if frames else pd.DataFrame(columns=["Entity", "part_column",
@@ -210,7 +221,7 @@ def to_matrix(long_out: pd.DataFrame) -> pd.DataFrame:
     """Wide matrix: entities x item codes (codes are unique across parts)."""
     if long_out.empty:
         return pd.DataFrame()
-    wide = (long_out.pivot_table(index="Entity", columns="item_code",
+    wide = (long_out.pivot_table(index=["PED_NO", "Entity"], columns="item_code",
                                  values="amount", aggfunc="sum")
             .fillna(0.0))
     return wide
@@ -264,16 +275,19 @@ if st.button("Generate F-33 Output", type="primary"):
         df_exp, exp_unmatched_entities, exp_ent_unmatched_dollars = attach_ped_no(df_exp, alias_map)
         df_rev, rev_unmatched_entities, rev_ent_unmatched_dollars = attach_ped_no(df_rev, alias_map)
         exp_long, exp_new, exp_stats, exp_blank = run_pipeline(
-            df_exp, xw_exp, EXP_KEYS, exp_parts, ov_exp_path)
+            df_exp, xw_exp, EXP_KEYS, exp_parts, ov_exp_path,
+            exclusion_rule=exp_exclusions)
         rev_long, rev_new, rev_stats, rev_blank = run_pipeline(
             df_rev, xw_rev, REV_KEYS, rev_parts, None,
-            exclusion_rule=is_excluded_rev_object)
+            exclusion_rule=lambda d: d["Object"].map(is_excluded_rev_object))
 
-    ready = (exp_stats["unmatched_dollars"] == 0
-             and exp_stats["blank_mapped_dollars"] == 0
-             and rev_stats["unmatched_dollars"] == 0
-             and exp_ent_unmatched_dollars == 0
-             and rev_ent_unmatched_dollars == 0)
+    ready = all(abs(v) < 0.005 for v in (
+        exp_stats["unmatched_dollars"],
+        exp_stats["blank_mapped_dollars"],
+        rev_stats["unmatched_dollars"],
+        exp_ent_unmatched_dollars,
+        rev_ent_unmatched_dollars,
+    ))
     if ready:
         st.success("All dollars mapped. Output is submission-grade.")
     else:
@@ -309,6 +323,11 @@ if st.button("Generate F-33 Output", type="primary"):
                    f"objects + 41924 flow-through): "
                    f"${rev_stats.get('excluded_dollars', 0):,.2f} — per FY24 "
                    f"practice, not an error.")
+        st.caption(f"Expenditure intentionally excluded (58214 reserve booked "
+                   f"in error, 55912 charter flowthrough, 53414/54320 in debt "
+                   f"context): ${exp_stats.get('excluded_dollars', 0):,.2f}. "
+                   f"Principal 58311/58313 is NOT excluded — it is reported in "
+                   f"Part VI (31F).")
     with t2:
         sw = pd.concat([
             exp_long.assign(side="Expenditure"),
@@ -334,9 +353,10 @@ if st.button("Generate F-33 Output", type="primary"):
                  "(append to xwalk_rev CSV):")
         st.dataframe(rev_new, use_container_width=True, height=200)
         dl_button("Download rev new combos", rev_new, "new_combos_rev.csv")
-        st.write(f"**Expenditure rows matched but PartII-Total/III/IV all "
-                 f"blank** (real $ missing from the total, not caught by "
-                 f"new-combos): ${exp_stats['blank_mapped_dollars']:,.2f}")
+        st.write(f"**Expenditure rows matched but ALL part columns blank** "
+                 f"(real $ missing from the form, not caught by new-combos "
+                 f"and not on the intentional exclusion list): "
+                 f"${exp_stats['blank_mapped_dollars']:,.2f}")
         st.dataframe(exp_blank, use_container_width=True, height=260)
         dl_button("Download blank-mapped exp rows", exp_blank,
                 "blank_mapped_exp.csv")
