@@ -1,0 +1,17 @@
+# Data files - don't push sensitive PED data
+*.csv
+*.xlsx
+*.xls
+# ...except the crosswalks — these are reference logic, not data
+!xwalk_rev.csv
+!xwalk_exp_main.csv
+!xwalk_exp_fund.csv
+!xwalk_exp_teacher.csv
+
+# Python
+__pycache__/
+*.pyc
+.env
+.DS_Store
+# Streamlit
+.streamlit/secrets.toml
