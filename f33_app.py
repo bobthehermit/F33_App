@@ -36,17 +36,28 @@ import streamlit as st
 EXP_KEYS = ["Fund", "Function", "Object", "Program", "JobClass"]
 REV_KEYS = ["Fund", "Object"]
 META_COLS = {"Notes", "Note", "basis", "agreement", "donor_rows"}
-CORE_COLS = ["PartII-Total", "Part III", "Part IV"]
-# Revenue exclusion rule (per FY24 practice, confirmed against Reiner's
-# xwalk where every non-4xxxx object carries no F-33 codes):
-#   * any object NOT starting with '4' = balance-sheet item (11111/11112/
-#     11113 cash, etc.), not revenue -> excluded
-#   * object 41924 = district-to-charter flow-through -> excluded
-#     (double count; the charter reports it as its own revenue)
-EXP_EXCL_ANY   = {"58214", "55912"}   # debt service reserve booked in error;
-                                      # interagency/charter flowthrough
-EXP_EXCL_F5000 = {"53414", "54320"}   # issuance/professional fees, tech repairs
-                                      # — debt context only
+# ------------------------------------------------------- exclusion rules
+# EXPENDITURE — objects excluded in any function/fund context:
+#   58213 / 58214 / 58215  ES, emergency reserve, restricted set-aside.
+#                          PSAB: budget earmarks against unassigned cash
+#                          balance — never real expenditures. Any actuals
+#                          posted here are a district coding error.
+#   53713                  Indirect cost charge. Nets against indirect cost
+#                          recovery revenue (43212/43213/44107/44205);
+#                          reporting both sides double counts. Excluded on
+#                          FY25 NPEFS — F-33 matched for consistency.
+#   55912                  Interagency / district-to-charter flowthrough;
+#                          the charter reports it as its own expenditure.
+# NOT excluded: principal 58311/58313 -> reported in Part VI (31F).
+#               Bond interest stays inside total expenditure.
+EXP_EXCL_ANY   = {"58213", "58214", "58215", "53713", "55912"}
+
+# EXPENDITURE — excluded only in debt-service context (function 5000):
+#   53414  bond issuance / professional fees
+#   54320  tech-related repairs
+# The same objects in every other function are normal expenditures.
+EXP_EXCL_F5000 = {"53414", "54320"}
+
 
 def exp_exclusions(df: pd.DataFrame) -> pd.Series:
     o = df["Object"].astype(str).str.strip()
@@ -54,10 +65,20 @@ def exp_exclusions(df: pd.DataFrame) -> pd.Series:
     return o.isin(EXP_EXCL_ANY) | (f.eq("5000") & o.isin(EXP_EXCL_F5000))
 
 
+# REVENUE — per FY24 practice, confirmed against Reiner's xwalk where every
+# non-4xxxx object carries no F-33 codes:
+#   * any object NOT starting with '4' = balance-sheet item (11111/11112/
+#     11113 cash, etc.), not revenue
+#   * 41924  district-to-charter flowthrough; the charter reports it as its
+#            own revenue
+#   * 43212 / 43213 / 44107 / 44205  indirect cost recovery. Offsets the
+#            53713 expenditure exclusion above — both sides or neither.
+REV_EXCL_ANY = {"41924", "43212", "43213", "44107", "44205"}
+
 
 def is_excluded_rev_object(obj: str) -> bool:
     o = str(obj).strip()
-    return (not o.startswith("4")) or o == "41924"
+    return (not o.startswith("4")) or o in REV_EXCL_ANY
 
 # ----------------------------------------------------------------- helpers
 def clean_currency(val):
@@ -175,6 +196,11 @@ def run_pipeline(df: pd.DataFrame, xw: pd.DataFrame, keys: list[str],
     n_ov = 0
     if ov_path and os.path.exists(ov_path):
         n_ov = apply_overrides(merged, ov_path, keys, part_cols)
+        # apply_overrides writes part columns blind; re-blank so an override
+        # can never resurrect an intentionally excluded row.
+        for c in part_cols:
+            if c in merged.columns:
+                merged.loc[is_excl, c] = ""
     un = merged["_merge"] == "left_only"
     core_present = [c for c in part_cols if c in merged.columns]
     if core_present:
@@ -285,6 +311,7 @@ if st.button("Generate F-33 Output", type="primary"):
         exp_stats["unmatched_dollars"],
         exp_stats["blank_mapped_dollars"],
         rev_stats["unmatched_dollars"],
+        rev_stats["blank_mapped_dollars"],
         exp_ent_unmatched_dollars,
         rev_ent_unmatched_dollars,
     ))
@@ -296,7 +323,9 @@ if st.button("Generate F-33 Output", type="primary"):
             f"${exp_stats['unmatched_dollars']:,.2f} ({exp_stats['unmatched_rows']:,} rows), "
             f"blank-mapped dollars: ${exp_stats['blank_mapped_dollars']:,.2f}, "
             f"revenues ${rev_stats['unmatched_dollars']:,.2f} "
-            f"({rev_stats['unmatched_rows']:,} rows). Assign F-33 codes to the new "
+            f"({rev_stats['unmatched_rows']:,} rows), "
+            f"blank-mapped revenues: ${rev_stats['blank_mapped_dollars']:,.2f}. "
+            f"Assign F-33 codes to the new "
             f"combos, fix the blank-mapped rows, and rerun. "
             f"unmatched entities: expenditures ${exp_ent_unmatched_dollars:,.2f}, "
             f"revenues ${rev_ent_unmatched_dollars:,.2f}. ")
@@ -319,15 +348,27 @@ if st.button("Generate F-33 Output", type="primary"):
                     "Unmatched $", "Override rows", "Keyless rows dropped",
                     "Keyless $ dropped"])
         st.dataframe(rec, use_container_width=True)
-        st.caption(f"Revenue intentionally excluded (non-4xxxx balance-sheet "
-                   f"objects + 41924 flow-through): "
-                   f"${rev_stats.get('excluded_dollars', 0):,.2f} — per FY24 "
-                   f"practice, not an error.")
-        st.caption(f"Expenditure intentionally excluded (58214 reserve booked "
-                   f"in error, 55912 charter flowthrough, 53414/54320 in debt "
-                   f"context): ${exp_stats.get('excluded_dollars', 0):,.2f}. "
-                   f"Principal 58311/58313 is NOT excluded — it is reported in "
-                   f"Part VI (31F).")
+        st.caption(
+            f"**Revenue intentionally excluded: "
+            f"${rev_stats.get('excluded_dollars', 0):,.2f}** — non-4xxxx "
+            f"balance-sheet objects (11111/11112 cash), 41924 district-to-"
+            f"charter flowthrough, and 43212/43213/44107/44205 indirect cost "
+            f"recovery. Per FY24 practice and consistent with FY25 NPEFS; "
+            f"not an error.")
+        st.caption(
+            f"**Expenditure intentionally excluded: "
+            f"${exp_stats.get('excluded_dollars', 0):,.2f}** — 58213/58214/"
+            f"58215 ES, emergency reserve and restricted set-aside (PSAB "
+            f"budget earmarks, not expenditures); 53713 indirect cost charge "
+            f"(nets against the recovery revenue above); 55912 interagency/"
+            f"charter flowthrough; 53414/54320 in debt-service context "
+            f"(function 5000) only. Principal 58311/58313 is NOT excluded — "
+            f"it is reported in Part VI (31F), and bond interest remains "
+            f"inside total expenditure.")
+        st.caption(
+            "Consistency note: the indirect cost and reserve exclusions "
+            "mirror the FY25 NPEFS submission line for line. Both filings "
+            "start from the same Power BI export.")
     with t2:
         sw = pd.concat([
             exp_long.assign(side="Expenditure"),
@@ -360,6 +401,13 @@ if st.button("Generate F-33 Output", type="primary"):
         st.dataframe(exp_blank, use_container_width=True, height=260)
         dl_button("Download blank-mapped exp rows", exp_blank,
                 "blank_mapped_exp.csv")
+        st.write(f"**Revenue rows matched but ALL part columns blank** "
+                 f"(real $ missing from the form, not caught by new-combos "
+                 f"and not on the intentional exclusion list): "
+                 f"${rev_stats['blank_mapped_dollars']:,.2f}")
+        st.dataframe(rev_blank, use_container_width=True, height=200)
+        dl_button("Download blank-mapped rev rows", rev_blank,
+                "blank_mapped_rev.csv")
     with t5:
         st.write("**Expenditure entities not found in entity_alias.csv** "
                  "(add them with their PED_NO before this is submission-ready):")
